@@ -37,7 +37,29 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Set environment variables for Google API credentials and LLM configuration:
+Configuration can be set via **config file**, **environment variables**, or **command-line arguments** with the following priority:
+1. **Command-line arguments** (highest priority)
+2. **Environment variables**
+3. **Config file** (`config.yaml` or `~/.web_search_agent/config.yaml`)
+4. **Defaults** (lowest priority)
+
+### Config File Setup
+
+1. Copy the example config file:
+   ```bash
+   cp config.yaml.example config.yaml
+   ```
+
+2. Edit `config.yaml` with your settings:
+   ```yaml
+   google_api_key: "your-google-api-key"
+   google_search_engine_id: "your-search-engine-id"
+   llm_provider: "ollama"
+   llm_model: "llama3.1"
+   # ... see config.yaml.example for all options
+   ```
+
+### Environment Variables
 
 ```bash
 # Required: Google API credentials
@@ -48,19 +70,52 @@ export GOOGLE_SEARCH_ENGINE_ID="your-search-engine-id"
 export LLM_PROVIDER="ollama"  # or "openai"
 export LLM_MODEL="llama3.1"   # or "gpt-3.5-turbo", "gpt-4", etc.
 export OLLAMA_BASE_URL="http://localhost:11434"  # Ollama server URL
+export OPENAI_API_KEY="your-openai-api-key"  # Only needed if using OpenAI
 
-# Optional: Only needed if using OpenAI
-export OPENAI_API_KEY="your-openai-api-key"
+# Optional: ReAct and Search configuration
+export REACT_MAX_ITERS="5"           # Max reasoning iterations
+export SEARCH_NUM_RESULTS="5"        # Number of search results (max: 10)
+
+# Optional: LLM generation parameters
+export LLM_TEMPERATURE="0.0"         # Temperature (0.0-2.0)
+export LLM_MAX_TOKENS="1000"         # Max tokens per response
+export LLM_CACHE="true"              # Enable caching (true/false)
 ```
 
-Or pass them as command-line arguments (see Usage below).
+### All Configurable Parameters
+
+| Parameter | Config Key | Env Var | CLI Arg | Default | Description |
+|-----------|-----------|---------|---------|---------|-------------|
+| Google API Key | `google_api_key` | `GOOGLE_API_KEY` | `--api-key` | *Required* | Google Custom Search API key |
+| Search Engine ID | `google_search_engine_id` | `GOOGLE_SEARCH_ENGINE_ID` | `--search-engine-id` | *Required* | Google Custom Search Engine ID |
+| LLM Provider | `llm_provider` | `LLM_PROVIDER` | `--llm-provider` | `ollama` | `ollama` or `openai` |
+| LLM Model | `llm_model` | `LLM_MODEL` | `--model` | `llama3.1` (Ollama) or `gpt-3.5-turbo` (OpenAI) | Model name |
+| Ollama Base URL | `ollama_base_url` | `OLLAMA_BASE_URL` | `--ollama-base-url` | `http://localhost:11434` | Ollama server URL |
+| OpenAI API Key | `openai_api_key` | `OPENAI_API_KEY` | `--openai-api-key` | *Required if using OpenAI* | OpenAI API key |
+| Max Iterations | `react_max_iters` | `REACT_MAX_ITERS` | `--max-iters` | `5` | Max ReAct reasoning iterations |
+| Search Results | `search_num_results` | `SEARCH_NUM_RESULTS` | `--search-num-results` | `5` | Number of search results (max: 10) |
+| Temperature | `llm_temperature` | `LLM_TEMPERATURE` | `--temperature` | `0.0` | LLM temperature (0.0-2.0) |
+| Max Tokens | `llm_max_tokens` | `LLM_MAX_TOKENS` | `--max-tokens` | `1000` | Max tokens per response |
+| Cache | `llm_cache` | `LLM_CACHE` | `--no-cache` | `true` | Enable LLM response caching |
+| Config File | `config` | `CONFIG_FILE` | `--config` | `config.yaml` | Path to config file |
 
 ## Usage
 
-### Basic Search (Uses Ollama llama3.1 by default)
+### Basic Search (Uses config file or defaults)
 
 ```bash
+# Using config file (recommended)
 python web_search_agent.py "What is the latest news about AI?"
+
+# Using environment variables
+export GOOGLE_API_KEY="your-key"
+export GOOGLE_SEARCH_ENGINE_ID="your-id"
+python web_search_agent.py "What is the latest news about AI?"
+
+# Using command-line arguments
+python web_search_agent.py "What is the latest news about AI?" \
+  --api-key "your-google-key" \
+  --search-engine-id "your-engine-id"
 ```
 
 ### With Piped Context
@@ -76,25 +131,70 @@ cat context.txt | python web_search_agent.py "Summarize this information"
 ### Using Different Ollama Models
 
 ```bash
-# Use a different Ollama model
+# Via config file: set llm_model: "llama3.2" in config.yaml
+python web_search_agent.py "Your query"
+
+# Via environment variable
+export LLM_MODEL="llama3.2"
+python web_search_agent.py "Your query"
+
+# Via command-line
 python web_search_agent.py "Your query" --model "llama3.2"
 
-# Use custom Ollama server URL
-python web_search_agent.py "Your query" --ollama-base-url "http://localhost:11434"
+# Custom Ollama server URL
+python web_search_agent.py "Your query" \
+  --ollama-base-url "http://localhost:11434" \
+  --model "llama3.2"
 ```
 
 ### Using OpenAI Instead of Ollama
 
 ```bash
-# Switch to OpenAI provider
-python web_search_agent.py "Your query" --llm-provider openai --model "gpt-4"
+# Via config file: set llm_provider: "openai" and openai_api_key in config.yaml
+python web_search_agent.py "Your query"
 
-# Or with API credentials via command-line
-python web_search_agent.py "Search query" \
+# Via environment variables
+export LLM_PROVIDER="openai"
+export OPENAI_API_KEY="your-openai-key"
+python web_search_agent.py "Your query"
+
+# Via command-line
+python web_search_agent.py "Your query" \
+  --llm-provider openai \
+  --openai-api-key "your-openai-key" \
+  --model "gpt-4"
+```
+
+### Advanced Configuration Examples
+
+```bash
+# Custom ReAct iterations and search results
+python web_search_agent.py "Complex query" \
+  --max-iters 10 \
+  --search-num-results 8
+
+# Custom LLM parameters
+python web_search_agent.py "Creative query" \
+  --temperature 0.7 \
+  --max-tokens 2000
+
+# Disable caching
+python web_search_agent.py "Query" --no-cache
+
+# Use custom config file
+python web_search_agent.py "Query" --config /path/to/custom-config.yaml
+
+# Full example with all parameters
+python web_search_agent.py "What are the latest AI developments?" \
   --api-key "your-google-key" \
   --search-engine-id "your-engine-id" \
   --llm-provider openai \
-  --model "gpt-3.5-turbo"
+  --openai-api-key "your-openai-key" \
+  --model "gpt-4" \
+  --max-iters 7 \
+  --search-num-results 6 \
+  --temperature 0.3 \
+  --max-tokens 1500
 ```
 
 ## How It Works
@@ -129,7 +229,8 @@ python web_search_agent.py "Search query" \
 ## Example Workflow
 
 ```bash
-# Example 1: Simple search with Ollama (default)
+# Example 1: Simple search with config file (recommended)
+# Set up config.yaml first, then:
 python web_search_agent.py "What are the best practices for Python error handling?"
 
 # Example 2: Search with context
@@ -139,24 +240,56 @@ echo "The user is working on a machine learning project" | \
 # Example 3: Using in a pipeline
 cat requirements.txt | python web_search_agent.py "Are there any security vulnerabilities in these packages?"
 
-# Example 4: Using OpenAI instead
-python web_search_agent.py "Your query" --llm-provider openai --model "gpt-4"
+# Example 4: Using OpenAI with custom parameters
+python web_search_agent.py "Your query" \
+  --llm-provider openai \
+  --openai-api-key "your-key" \
+  --model "gpt-4" \
+  --max-iters 7 \
+  --temperature 0.3
 
-# Example 5: Custom Ollama model
-python web_search_agent.py "Your query" --model "llama3.2" --ollama-base-url "http://localhost:11434"
+# Example 5: Custom Ollama model with advanced settings
+python web_search_agent.py "Your query" \
+  --model "llama3.2" \
+  --ollama-base-url "http://localhost:11434" \
+  --max-iters 10 \
+  --search-num-results 8 \
+  --max-tokens 2000
+
+# Example 6: Using environment variables
+export GOOGLE_API_KEY="your-key"
+export GOOGLE_SEARCH_ENGINE_ID="your-id"
+export LLM_PROVIDER="openai"
+export OPENAI_API_KEY="your-openai-key"
+export LLM_MODEL="gpt-4"
+python web_search_agent.py "Your query"
 ```
 
-## Environment Variables
+## Environment Variables Reference
 
 ### Required
 - `GOOGLE_API_KEY`: Your Google API key
 - `GOOGLE_SEARCH_ENGINE_ID`: Your Custom Search Engine ID
 
-### Optional (LLM Configuration)
+### Optional - LLM Configuration
 - `LLM_PROVIDER`: LLM provider to use - `"ollama"` (default) or `"openai"`
 - `LLM_MODEL`: Model name - `"llama3.1"` (default for Ollama) or `"gpt-3.5-turbo"` (default for OpenAI)
 - `OLLAMA_BASE_URL`: Ollama server URL - `"http://localhost:11434"` (default)
 - `OPENAI_API_KEY`: Your OpenAI API key (required only if using OpenAI provider)
+
+### Optional - ReAct Agent Configuration
+- `REACT_MAX_ITERS`: Maximum number of reasoning iterations (default: `5`)
+
+### Optional - Search Configuration
+- `SEARCH_NUM_RESULTS`: Number of search results to return (default: `5`, max: `10`)
+
+### Optional - LLM Generation Parameters
+- `LLM_TEMPERATURE`: Temperature for LLM generation (default: `0.0`, range: `0.0-2.0`)
+- `LLM_MAX_TOKENS`: Maximum tokens for LLM response (default: `1000`)
+- `LLM_CACHE`: Enable LLM response caching (default: `true`, values: `true`/`false`)
+
+### Optional - Config File
+- `CONFIG_FILE`: Path to custom config file (default: `config.yaml` or `~/.web_search_agent/config.yaml`)
 
 ## Technical Details: DSPy ReAct Configuration
 

@@ -1,0 +1,29 @@
+# DSPy ReAct Web Search Agent Configuration File
+# Copy this file to config.yaml and update with your values
+# Priority: CLI arguments > Environment variables > Config file > Defaults
+
+# Required: Google Custom Search API credentials
+google_api_key: "your-google-api-key-here"
+google_search_engine_id: "your-search-engine-id-here"
+
+# LLM Configuration
+llm_provider: "ollama"  # Options: "ollama" or "openai"
+llm_model: "llama3.1"   # Model name (e.g., "llama3.1", "llama3.2", "gpt-3.5-turbo", "gpt-4")
+
+# Ollama Configuration (only needed if using Ollama)
+ollama_base_url: "http://localhost:11434"
+
+# OpenAI Configuration (only needed if using OpenAI)
+openai_api_key: "your-openai-api-key-here"
+
+# ReAct Agent Configuration
+react_max_iters: 3  # Maximum number of reasoning iterations (default: 5)
+
+# Search Configuration
+search_num_results: 5  # Number of search results to return (default: 5, max: 10)
+
+# LLM Generation Parameters
+llm_temperature: 0.0    # Temperature for LLM generation (default: 0.0, range: 0.0-2.0)
+llm_max_tokens: 1000    # Maximum tokens for LLM response (default: 1000)
+llm_cache: true         # Enable LLM response caching (default: true)
+

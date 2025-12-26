@@ -27,6 +27,13 @@ import os
 import argparse
 from typing import Optional, List, Dict, Tuple
 import json
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("Error: PyYAML is not installed. Please install it with: pip install pyyaml")
+    sys.exit(1)
 
 try:
     import dspy
@@ -66,6 +73,76 @@ except ImportError as e:
     print(f"Error: LangChain is not installed. Please install it with: pip install langchain langchain-ollama langchain-openai")
     print(f"Import error: {e}", file=sys.stderr)
     sys.exit(1)
+
+
+def load_config(config_path: Optional[str] = None) -> Dict:
+    """
+    Load configuration from YAML file, with environment variable support.
+    
+    Priority order: Environment variables > Config file > Defaults
+    
+    Args:
+        config_path: Path to config file. If None, looks for:
+                    1. CONFIG_FILE env var
+                    2. config.yaml in current directory
+                    3. ~/.web_search_agent/config.yaml
+    
+    Returns:
+        Dictionary with configuration values
+    """
+    config = {}
+    
+    # Default config file locations
+    if config_path is None:
+        config_path = os.getenv("CONFIG_FILE")
+        if config_path is None:
+            # Try current directory
+            if Path("config.yaml").exists():
+                config_path = "config.yaml"
+            # Try home directory
+            elif Path.home().joinpath(".web_search_agent", "config.yaml").exists():
+                config_path = str(Path.home().joinpath(".web_search_agent", "config.yaml"))
+    
+    # Load from file if it exists
+    if config_path and Path(config_path).exists():
+        try:
+            with open(config_path, 'r') as f:
+                file_config = yaml.safe_load(f) or {}
+                config.update(file_config)
+        except Exception as e:
+            print(f"Warning: Could not load config file {config_path}: {e}", file=sys.stderr)
+    
+    # Override with environment variables (higher priority)
+    env_mappings = {
+        'GOOGLE_API_KEY': 'google_api_key',
+        'GOOGLE_SEARCH_ENGINE_ID': 'google_search_engine_id',
+        'LLM_PROVIDER': 'llm_provider',
+        'LLM_MODEL': 'llm_model',
+        'OLLAMA_BASE_URL': 'ollama_base_url',
+        'OPENAI_API_KEY': 'openai_api_key',
+        'REACT_MAX_ITERS': 'react_max_iters',
+        'SEARCH_NUM_RESULTS': 'search_num_results',
+        'LLM_TEMPERATURE': 'llm_temperature',
+        'LLM_MAX_TOKENS': 'llm_max_tokens',
+        'LLM_CACHE': 'llm_cache',
+    }
+    
+    for env_var, config_key in env_mappings.items():
+        env_value = os.getenv(env_var)
+        if env_value is not None:
+            # Convert string booleans and numbers
+            if env_value.lower() in ('true', '1', 'yes'):
+                config[config_key] = True
+            elif env_value.lower() in ('false', '0', 'no'):
+                config[config_key] = False
+            elif env_value.isdigit():
+                config[config_key] = int(env_value)
+            elif env_value.replace('.', '', 1).isdigit():
+                config[config_key] = float(env_value)
+            else:
+                config[config_key] = env_value
+    
+    return config
 
 
 class GoogleSearchTool:
@@ -116,7 +193,7 @@ class GoogleSearchTool:
             return []
 
 
-def create_llm(provider: str = "ollama", model_name: str = "llama3.1", base_url: Optional[str] = None) -> BaseLanguageModel:
+def create_llm(provider: str = "ollama", model_name: str = "llama3.1", base_url: Optional[str] = None, openai_api_key: Optional[str] = None) -> BaseLanguageModel:
     """
     Create a LangChain LLM instance based on provider.
     
@@ -136,11 +213,11 @@ def create_llm(provider: str = "ollama", model_name: str = "llama3.1", base_url:
         # Use the available Ollama class (either OllamaLLM or deprecated Ollama)
         return OLLAMA_CLASS(model=model_name, base_url=ollama_base_url)
     elif provider.lower() == "openai":
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required for OpenAI provider")
+            raise ValueError("OPENAI_API_KEY is required for OpenAI provider. Set it in config file, env var, or pass as parameter")
         print(f"Using OpenAI with model '{model_name}'", file=sys.stderr)
-        return ChatOpenAI(model=model_name, temperature=0)
+        return ChatOpenAI(model=model_name, temperature=0, api_key=api_key)
     else:
         raise ValueError(f"Unsupported LLM provider: {provider}. Supported: 'ollama', 'openai'")
 
@@ -278,7 +355,12 @@ class WebSearchAgent:
         llm_provider: str = "ollama",
         model_name: str = "llama3.1",
         ollama_base_url: Optional[str] = None,
-        max_iters: int = 5
+        openai_api_key: Optional[str] = None,
+        max_iters: int = 5,
+        search_num_results: int = 5,
+        llm_temperature: float = 0.0,
+        llm_max_tokens: int = 1000,
+        llm_cache: bool = True
     ):
         """
         Initialize the Web Search Agent with DSPy's native ReAct module.
@@ -289,8 +371,14 @@ class WebSearchAgent:
             llm_provider: LLM provider ("ollama" or "openai")
             model_name: Model name (e.g., "llama3.1", "gpt-3.5-turbo")
             ollama_base_url: Base URL for Ollama (default: http://localhost:11434)
+            openai_api_key: OpenAI API key (required if using OpenAI provider)
             max_iters: Maximum number of reasoning iterations for ReAct agent
+            search_num_results: Number of search results to return (default: 5, max: 10)
+            llm_temperature: LLM temperature for generation (default: 0.0)
+            llm_max_tokens: Maximum tokens for LLM response (default: 1000)
+            llm_cache: Whether to cache LLM responses (default: True)
         """
+        self.search_num_results = search_num_results
         # Initialize Google Search Tool
         self.search_tool = GoogleSearchTool(api_key, search_engine_id)
         
@@ -301,10 +389,16 @@ class WebSearchAgent:
         
         try:
             # Create LangChain LLM
-            self.langchain_llm = create_llm(llm_provider, model_name, ollama_base_url)
+            self.langchain_llm = create_llm(llm_provider, model_name, ollama_base_url, openai_api_key)
             
-            # Create DSPy-compatible LM wrapper
-            self.dspy_lm = LangChainDSPyLM(self.langchain_llm, model_name=f"{llm_provider}/{model_name}")
+            # Create DSPy-compatible LM wrapper with configurable parameters
+            self.dspy_lm = LangChainDSPyLM(
+                self.langchain_llm, 
+                model_name=f"{llm_provider}/{model_name}",
+                temperature=llm_temperature,
+                max_tokens=llm_max_tokens,
+                cache=llm_cache
+            )
             
             # Configure DSPy with the LM
             dspy.configure(lm=self.dspy_lm)
@@ -322,17 +416,19 @@ class WebSearchAgent:
                 print("Note: Could not verify LM configuration, but proceeding...", file=sys.stderr)
             
             # Create the Google search tool function for DSPy
-            def google_search(query: str, num_results: int = 5) -> str:
+            def google_search(query: str, num_results: Optional[int] = None) -> str:
                 """
                 Search the web using Google Custom Search API.
                 
                 Args:
                     query: The search query string
-                    num_results: Number of results to return (default: 5, max: 10)
+                    num_results: Number of results to return (default: from config, max: 10)
                 
                 Returns:
                     Formatted string containing search results with titles, URLs, and snippets
                 """
+                if num_results is None:
+                    num_results = self.search_num_results
                 results = self.search_tool.search(query, num_results)
                 if not results:
                     return "No search results found."
@@ -446,18 +542,22 @@ class WebSearchAgent:
         return "\n".join(output)
 
 
-def get_input() -> Tuple[str, Optional[str], str, str, str, str, Optional[str]]:
+def get_input() -> Dict:
     """
-    Get input from command-line arguments or stdin.
+    Get input from command-line arguments, environment variables, or config file.
+    Priority: CLI arguments > Environment variables > Config file > Defaults
     
     Returns:
-        Tuple of (text_input, piped_context, api_key, search_engine_id, llm_provider, model_name, ollama_base_url)
+        Dictionary with all configuration values
     """
     piped_context = None
     
     # Check if there's piped input
     if not sys.stdin.isatty():
         piped_context = sys.stdin.read().strip()
+    
+    # Load config file first (lowest priority)
+    config = load_config()
     
     # Get command-line arguments
     parser = argparse.ArgumentParser(
@@ -468,6 +568,7 @@ Examples:
   python web_search_agent.py "What is the latest news about AI?"
   echo "Python best practices" | python web_search_agent.py "What does this mean?"
   cat context.txt | python web_search_agent.py "Summarize this"
+  python web_search_agent.py "Query" --config config.yaml
         """
     )
     parser.add_argument(
@@ -476,57 +577,118 @@ Examples:
         help="Search query or question (optional if piped input is provided)"
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config file (YAML format). Default: config.yaml or ~/.web_search_agent/config.yaml"
+    )
+    parser.add_argument(
         "--api-key",
         default=None,
-        help="Google API key (or set GOOGLE_API_KEY env var)"
+        help="Google API key (overrides config file and env var)"
     )
     parser.add_argument(
         "--search-engine-id",
         default=None,
-        help="Google Custom Search Engine ID (or set GOOGLE_SEARCH_ENGINE_ID env var)"
+        help="Google Custom Search Engine ID (overrides config file and env var)"
     )
     parser.add_argument(
         "--llm-provider",
         default=None,
         choices=["ollama", "openai"],
-        help="LLM provider to use: 'ollama' or 'openai' (default: ollama, or set LLM_PROVIDER env var)"
+        help="LLM provider: 'ollama' or 'openai' (overrides config file and env var)"
     )
     parser.add_argument(
         "--model",
         default=None,
-        help="LLM model name (default: llama3.1 for Ollama, gpt-3.5-turbo for OpenAI, or set LLM_MODEL env var)"
+        help="LLM model name (overrides config file and env var)"
     )
     parser.add_argument(
         "--ollama-base-url",
         default=None,
-        help="Ollama base URL (default: http://localhost:11434, or set OLLAMA_BASE_URL env var)"
+        help="Ollama base URL (overrides config file and env var)"
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="OpenAI API key (overrides config file and env var)"
+    )
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=None,
+        help="Maximum ReAct reasoning iterations (overrides config file and env var)"
+    )
+    parser.add_argument(
+        "--search-num-results",
+        type=int,
+        default=None,
+        help="Number of search results to return (overrides config file and env var)"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="LLM temperature (overrides config file and env var)"
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Maximum tokens for LLM response (overrides config file and env var)"
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable LLM response caching (overrides config file and env var)"
     )
     
     args = parser.parse_args()
     
-    # Get LLM configuration
-    llm_provider = args.llm_provider or os.getenv("LLM_PROVIDER", "ollama")
+    # Reload config if custom path provided
+    if args.config:
+        config = load_config(args.config)
     
-    # Set default model based on provider
+    # Apply CLI arguments (highest priority)
+    if args.api_key:
+        config['google_api_key'] = args.api_key
+    if args.search_engine_id:
+        config['google_search_engine_id'] = args.search_engine_id
+    if args.llm_provider:
+        config['llm_provider'] = args.llm_provider
     if args.model:
-        model_name = args.model
-    elif os.getenv("LLM_MODEL"):
-        model_name = os.getenv("LLM_MODEL")
-    else:
+        config['llm_model'] = args.model
+    if args.ollama_base_url:
+        config['ollama_base_url'] = args.ollama_base_url
+    if args.openai_api_key:
+        config['openai_api_key'] = args.openai_api_key
+    if args.max_iters is not None:
+        config['react_max_iters'] = args.max_iters
+    if args.search_num_results is not None:
+        config['search_num_results'] = args.search_num_results
+    if args.temperature is not None:
+        config['llm_temperature'] = args.temperature
+    if args.max_tokens is not None:
+        config['llm_max_tokens'] = args.max_tokens
+    if args.no_cache:
+        config['llm_cache'] = False
+    
+    # Set defaults for missing values
+    llm_provider = config.get('llm_provider', 'ollama')
+    model_name = config.get('llm_model')
+    if not model_name:
         model_name = "llama3.1" if llm_provider == "ollama" else "gpt-3.5-turbo"
+        config['llm_model'] = model_name
     
-    ollama_base_url = args.ollama_base_url or os.getenv("OLLAMA_BASE_URL")
-    
-    # Get API credentials
-    api_key = args.api_key or os.getenv("GOOGLE_API_KEY")
-    search_engine_id = args.search_engine_id or os.getenv("GOOGLE_SEARCH_ENGINE_ID")
+    # Get required values
+    api_key = config.get('google_api_key')
+    search_engine_id = config.get('google_search_engine_id')
     
     if not api_key:
-        print("Error: Google API key is required. Set GOOGLE_API_KEY env var or use --api-key", file=sys.stderr)
+        print("Error: Google API key is required. Set in config file, GOOGLE_API_KEY env var, or use --api-key", file=sys.stderr)
         sys.exit(1)
     
     if not search_engine_id:
-        print("Error: Google Custom Search Engine ID is required. Set GOOGLE_SEARCH_ENGINE_ID env var or use --search-engine-id", file=sys.stderr)
+        print("Error: Google Custom Search Engine ID is required. Set in config file, GOOGLE_SEARCH_ENGINE_ID env var, or use --search-engine-id", file=sys.stderr)
         sys.exit(1)
     
     # Determine the query
@@ -542,24 +704,47 @@ Examples:
         text_input = piped_context
         piped_context = None
     
-    return text_input, piped_context, api_key, search_engine_id, llm_provider, model_name, ollama_base_url
+    # Build final config dict
+    final_config = {
+        'query': text_input,
+        'piped_context': piped_context,
+        'google_api_key': api_key,
+        'google_search_engine_id': search_engine_id,
+        'llm_provider': llm_provider,
+        'llm_model': model_name,
+        'ollama_base_url': config.get('ollama_base_url'),
+        'openai_api_key': config.get('openai_api_key'),
+        'react_max_iters': config.get('react_max_iters', 5),
+        'search_num_results': config.get('search_num_results', 5),
+        'llm_temperature': config.get('llm_temperature', 0.0),
+        'llm_max_tokens': config.get('llm_max_tokens', 1000),
+        'llm_cache': config.get('llm_cache', True),
+    }
+    
+    return final_config
 
 
 def main():
     """Main entry point for the script."""
-    text_input, piped_context, api_key, search_engine_id, llm_provider, model_name, ollama_base_url = get_input()
+    config = get_input()
     
-    # Initialize the agent
+    # Initialize the agent with all configurable parameters
     agent = WebSearchAgent(
-        api_key, 
-        search_engine_id, 
-        llm_provider=llm_provider,
-        model_name=model_name,
-        ollama_base_url=ollama_base_url
+        api_key=config['google_api_key'],
+        search_engine_id=config['google_search_engine_id'],
+        llm_provider=config['llm_provider'],
+        model_name=config['llm_model'],
+        ollama_base_url=config.get('ollama_base_url'),
+        openai_api_key=config.get('openai_api_key'),
+        max_iters=config['react_max_iters'],
+        search_num_results=config['search_num_results'],
+        llm_temperature=config['llm_temperature'],
+        llm_max_tokens=config['llm_max_tokens'],
+        llm_cache=config['llm_cache']
     )
     
     # Perform search
-    result = agent.search(text_input, piped_context)
+    result = agent.search(config['query'], config.get('piped_context'))
     
     # Output result
     print(result)
