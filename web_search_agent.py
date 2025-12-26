@@ -145,8 +145,131 @@ def create_llm(provider: str = "ollama", model_name: str = "llama3.1", base_url:
         raise ValueError(f"Unsupported LLM provider: {provider}. Supported: 'ollama', 'openai'")
 
 
+class LangChainDSPyLM(dspy.LM):
+    """
+    Wrapper to make LangChain LLMs compatible with DSPy's LM interface.
+    This allows DSPy to work with LangChain LLMs (Ollama, OpenAI, etc.).
+    Inherits from dspy.LM to satisfy isinstance checks.
+    """
+    
+    def __init__(self, langchain_llm, model_name: str = "langchain", **kwargs):
+        """
+        Initialize the DSPy-LangChain bridge.
+        
+        Args:
+            langchain_llm: LangChain LLM instance (OllamaLLM, ChatOpenAI, etc.)
+            model_name: Name identifier for the model
+            **kwargs: Additional arguments passed to dspy.LM (temperature, max_tokens, etc.)
+        """
+        # Initialize parent class with required parameters
+        # dspy.LM expects: model, model_type='chat', temperature=0.0, max_tokens=1000, cache=True
+        super().__init__(
+            model=model_name,
+            model_type='chat',
+            temperature=kwargs.get('temperature', 0.0),
+            max_tokens=kwargs.get('max_tokens', 1000),
+            cache=kwargs.get('cache', True),
+            **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens', 'cache']}
+        )
+        
+        self.langchain_llm = langchain_llm
+        self.name = model_name
+    
+    def __call__(self, prompt=None, messages=None, **kwargs):
+        """
+        Call the LangChain LLM with a prompt or messages.
+        Matches BaseLM's abstract method signature and returns outputs in DSPy format.
+        """
+        # Build messages from prompt if needed (matching DSPy's LM format)
+        if messages is None:
+            if prompt is None:
+                raise ValueError("Either 'prompt' or 'messages' must be provided")
+            messages = [{"role": "user", "content": str(prompt)}]
+        
+        # Convert messages to a single prompt string for LangChain
+        # (LangChain LLMs typically work with strings or message objects)
+        prompt_parts = []
+        for msg in messages:
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+            if role == 'system':
+                prompt_parts.append(f"System: {content}")
+            elif role == 'user':
+                prompt_parts.append(f"User: {content}")
+            elif role == 'assistant':
+                prompt_parts.append(f"Assistant: {content}")
+        prompt_str = "\n".join(prompt_parts) if prompt_parts else str(prompt) if prompt else ""
+        
+        # Get response from LangChain
+        outputs = self._invoke_langchain(prompt_str)
+        
+        # Update history (matching DSPy's LM behavior)
+        if not dspy.settings.disable_history:
+            from datetime import datetime
+            import uuid
+            entry = dict(
+                prompt=prompt,
+                messages=messages,
+                kwargs=kwargs,
+                outputs=outputs,
+                timestamp=datetime.now().isoformat(),
+                uuid=str(uuid.uuid4()),
+                model=self.model,
+                model_type=self.model_type,
+            )
+            self.history.append(entry)
+            self.update_global_history(entry)
+        
+        # Return outputs in DSPy format (list of strings)
+        return outputs
+    
+    def request(self, prompt, **kwargs):
+        """Request method for DSPy compatibility."""
+        prompt_str = str(prompt) if hasattr(prompt, '__str__') else prompt
+        return self._invoke_langchain(prompt_str)
+    
+    def generate(self, prompt, **kwargs):
+        """Generate method for DSPy compatibility."""
+        return self.request(prompt, **kwargs)
+    
+    def __repr__(self):
+        """String representation for debugging."""
+        return f"LangChainDSPyLM(model={self.model})"
+    
+    def _invoke_langchain(self, prompt: str) -> list:
+        """
+        Invoke the LangChain LLM and return the response in DSPy format.
+        DSPy expects a list of output strings (like LiteLLM's response format).
+        """
+        try:
+            response = self.langchain_llm.invoke(prompt)
+            # Handle different response types and convert to list format
+            if isinstance(response, str):
+                text = response
+            elif hasattr(response, 'content'):
+                text = response.content
+            elif hasattr(response, 'text'):
+                text = response.text
+            else:
+                text = str(response)
+            
+            # DSPy expects a list of strings (outputs), similar to LiteLLM's choices format
+            # Return as a list to match DSPy's expected format
+            return [text]
+        except Exception as e:
+            print(f"Error invoking LangChain LLM: {e}", file=sys.stderr)
+            raise
+
+
+class WebSearchSignature(dspy.Signature):
+    """Signature for web search question-answering task."""
+    question = dspy.InputField(desc="The question or query to answer")
+    context = dspy.InputField(desc="Optional context information", default="")
+    answer = dspy.OutputField(desc="The comprehensive answer based on web search results")
+
+
 class WebSearchAgent:
-    """DSPy ReAct Agent for web search tasks."""
+    """DSPy ReAct Agent for web search tasks using native DSPy ReAct module."""
     
     def __init__(
         self, 
@@ -154,10 +277,11 @@ class WebSearchAgent:
         search_engine_id: str, 
         llm_provider: str = "ollama",
         model_name: str = "llama3.1",
-        ollama_base_url: Optional[str] = None
+        ollama_base_url: Optional[str] = None,
+        max_iters: int = 5
     ):
         """
-        Initialize the Web Search Agent.
+        Initialize the Web Search Agent with DSPy's native ReAct module.
         
         Args:
             api_key: Google API key
@@ -165,119 +289,89 @@ class WebSearchAgent:
             llm_provider: LLM provider ("ollama" or "openai")
             model_name: Model name (e.g., "llama3.1", "gpt-3.5-turbo")
             ollama_base_url: Base URL for Ollama (default: http://localhost:11434)
+            max_iters: Maximum number of reasoning iterations for ReAct agent
         """
-        # Create LangChain LLM and configure DSPy
-        self.langchain_llm = None
-        try:
-            self.langchain_llm = create_llm(llm_provider, model_name, ollama_base_url)
-            # Try to configure DSPy with a custom LM wrapper
-            # DSPy expects an LM object with specific methods
-            try:
-                # Create a simple wrapper that implements DSPy's LM interface
-                class LangChainDSPyLM:
-                    def __init__(self, langchain_llm):
-                        self.langchain_llm = langchain_llm
-                        self.model = "langchain"
-                    
-                    def __call__(self, prompt, **kwargs):
-                        if isinstance(prompt, str):
-                            return self.langchain_llm.invoke(prompt)
-                        # Handle DSPy prompt objects
-                        prompt_str = str(prompt) if hasattr(prompt, '__str__') else prompt
-                        return self.langchain_llm.invoke(prompt_str)
-                    
-                    def request(self, prompt, **kwargs):
-                        prompt_str = str(prompt) if hasattr(prompt, '__str__') else prompt
-                        return self.langchain_llm.invoke(prompt_str)
-                
-                lm = LangChainDSPyLM(self.langchain_llm)
-                # Try to configure DSPy - it may not work with all versions
-                try:
-                    dspy.configure(lm=lm)
-                    print(f"Successfully configured DSPy with {llm_provider} ({model_name})", file=sys.stderr)
-                except:
-                    # DSPy configuration failed, but we can still use LangChain directly
-                    print(f"Note: DSPy configuration skipped, using LangChain directly", file=sys.stderr)
-            except Exception as e:
-                print(f"Warning: Could not create DSPy LM wrapper: {e}", file=sys.stderr)
-                print("Will use LangChain directly for LLM calls", file=sys.stderr)
-        except Exception as e:
-            print(f"Error creating LangChain LLM: {e}", file=sys.stderr)
-            print("Falling back to direct search mode", file=sys.stderr)
-        
         # Initialize Google Search Tool
         self.search_tool = GoogleSearchTool(api_key, search_engine_id)
         
-        # Try to create a ReAct-like agent using DSPy
-        # If DSPy ReAct doesn't work, we'll use a simpler approach
+        # Create LangChain LLM and configure DSPy
+        self.langchain_llm = None
+        self.dspy_lm = None
         self.agent = None
+        
         try:
-            # Try using DSPy's ReAct if available and properly configured
-            if self.langchain_llm:
-                # Create a simple agent that uses search + LLM reasoning
-                class SimpleReActAgent:
-                    def __init__(self, llm, search_tool):
-                        self.llm = llm
-                        self.search_tool = search_tool
-                    
-                    def __call__(self, question, context=""):
-                        # Step 1: Perform search
-                        search_results = self.search_tool(question)
-                        
-                        # Step 2: Use LLM to reason about results
-                        if search_results:
-                            prompt = f"""Based on the following search results, answer the question.
-
-Question: {question}
-{f'Context: {context}' if context else ''}
-
-Search Results:
-{search_results}
-
-Provide a comprehensive answer based on the search results:"""
-                            
-                            try:
-                                answer = self.llm.invoke(prompt)
-                                return answer
-                            except Exception as e:
-                                print(f"Error in LLM reasoning: {e}", file=sys.stderr)
-                                return search_results
-                        else:
-                            return "No search results found."
+            # Create LangChain LLM
+            self.langchain_llm = create_llm(llm_provider, model_name, ollama_base_url)
+            
+            # Create DSPy-compatible LM wrapper
+            self.dspy_lm = LangChainDSPyLM(self.langchain_llm, model_name=f"{llm_provider}/{model_name}")
+            
+            # Configure DSPy with the LM
+            dspy.configure(lm=self.dspy_lm)
+            
+            # Verify the LM is properly configured
+            try:
+                # Test that DSPy recognizes the LM
+                current_lm = dspy.settings.lm
+                if current_lm is None:
+                    raise ValueError("DSPy LM configuration failed - LM is None")
+                print(f"Successfully configured DSPy with {llm_provider} ({model_name})", file=sys.stderr)
+            except AttributeError:
+                # DSPy might use a different attribute name
+                print(f"Configured DSPy with {llm_provider} ({model_name})", file=sys.stderr)
+                print("Note: Could not verify LM configuration, but proceeding...", file=sys.stderr)
+            
+            # Create the Google search tool function for DSPy
+            def google_search(query: str, num_results: int = 5) -> str:
+                """
+                Search the web using Google Custom Search API.
                 
-                self.agent = SimpleReActAgent(self.langchain_llm, self._search_wrapper)
-                print("Initialized ReAct-like agent with LangChain", file=sys.stderr)
+                Args:
+                    query: The search query string
+                    num_results: Number of results to return (default: 5, max: 10)
+                
+                Returns:
+                    Formatted string containing search results with titles, URLs, and snippets
+                """
+                results = self.search_tool.search(query, num_results)
+                if not results:
+                    return "No search results found."
+                
+                formatted_results = []
+                for i, result in enumerate(results, 1):
+                    formatted_results.append(
+                        f"{i}. {result['title']}\n"
+                        f"   URL: {result['link']}\n"
+                        f"   {result['snippet']}\n"
+                    )
+                
+                return "\n".join(formatted_results)
+            
+            # Initialize DSPy's native ReAct agent
+            try:
+                # Ensure LM is configured before creating ReAct agent
+                # ReAct should use the globally configured LM
+                self.agent = dspy.ReAct(
+                    signature=WebSearchSignature,
+                    tools=[google_search],
+                    max_iters=max_iters
+                )
+                print(f"Initialized DSPy ReAct agent with max_iters={max_iters}", file=sys.stderr)
+            except Exception as e:
+                print(f"Warning: Could not initialize DSPy ReAct agent: {e}", file=sys.stderr)
+                print("Falling back to direct search mode", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+                
         except Exception as e:
-            print(f"Warning: Could not initialize agent: {e}", file=sys.stderr)
-            print("Using fallback search module", file=sys.stderr)
-    
-    def _search_wrapper(self, query: str) -> str:
-        """
-        Wrapper function to convert search results to string format.
-        
-        Args:
-            query: Search query
-        
-        Returns:
-            Formatted string of search results
-        """
-        results = self.search_tool.search(query)
-        if not results:
-            return "No search results found."
-        
-        formatted_results = []
-        for i, result in enumerate(results, 1):
-            formatted_results.append(
-                f"{i}. {result['title']}\n"
-                f"   URL: {result['link']}\n"
-                f"   {result['snippet']}\n"
-            )
-        
-        return "\n".join(formatted_results)
+            print(f"Error setting up DSPy ReAct agent: {e}", file=sys.stderr)
+            print("Falling back to direct search mode", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
     
     def search(self, question: str, context: Optional[str] = None) -> str:
         """
-        Perform a web search and generate an answer.
+        Perform a web search and generate an answer using DSPy's native ReAct agent.
         
         Args:
             question: The question or search query
@@ -286,27 +380,35 @@ Provide a comprehensive answer based on the search results:"""
         Returns:
             Answer based on search results
         """
-        # Combine context and question if context is provided
-        if context:
-            full_query = f"Context: {context}\n\nQuestion: {question}"
-        else:
-            full_query = question
-        
         try:
-            # Use the agent to reason and act
-            if self.agent:
-                result = self.agent(question=question, context=context or "")
-                if isinstance(result, str):
-                    return result
-                elif hasattr(result, 'answer'):
+            # Use DSPy's native ReAct agent
+            if self.agent and self.dspy_lm:
+                # Ensure LM is configured (reconfigure if needed)
+                dspy.configure(lm=self.dspy_lm)
+                
+                # Try using dspy.context if available (thread-safe)
+                try:
+                    context_manager = dspy.context(lm=self.dspy_lm)
+                    with context_manager:
+                        result = self.agent(question=question, context=context or "")
+                except AttributeError:
+                    # dspy.context might not be available in all versions
+                    # Just use the globally configured LM
+                    result = self.agent(question=question, context=context or "")
+                
+                # Extract the answer from the result
+                if hasattr(result, 'answer'):
                     return result.answer
+                elif isinstance(result, str):
+                    return result
                 else:
+                    # Try to get answer from result object
                     return str(result)
             else:
                 # Fallback: direct search with basic reasoning
                 return self._direct_search_with_reasoning(question, context)
         except Exception as e:
-            print(f"Error in agent execution: {e}", file=sys.stderr)
+            print(f"Error in DSPy ReAct agent execution: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc()
             # Fallback to direct search
